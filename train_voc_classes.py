@@ -116,16 +116,20 @@ def setup_model_name(class_name, use_box, train_mask, train_prompt, train_vision
   model_name = os.path.join(model_name, f'{class_name}.pth') 
   return model_name 
 
-def get_dataset(use_box, desired_class_id):
-  processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
-  dataset = torchvision.datasets.VOCSegmentation('vocsegmentation', image_set='train')
+def get_dataset_of_class(desired_class_id, path_to_dataset='vocsegmentation', image_set='train'):
+  # VOC (Airplane)
+  ds = torchvision.datasets.VOCSegmentation(path_to_dataset, image_set=image_set)
   inds = []
-  for i,d in enumerate(dataset):
+  for i,d in enumerate(ds):
       ct = np.unique(d[1])
       if desired_class_id in ct:
         inds.append(i)
-  dataset = Subset(dataset, inds)
+  ds = Subset(ds, inds)
+  return ds
 
+def get_dataset(use_box, desired_class_id):
+  processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+  dataset = get_dataset_of_class(desired_class_id=desired_class_id, image_set='train')
   train_dataset = SAMDataset(dataset=dataset, processor=processor, desired_class_id=desired_class_id, use_bounding_box=use_box)
   return train_dataset
 
@@ -158,10 +162,10 @@ def get_model(train_mask, train_prompt, train_vision):
 @click.option('--train-mask', is_flag=True, help='Flag to train mask.')
 @click.option('--train-prompt', is_flag=True, help='Flag to train prompt.')
 @click.option('--train-vision', is_flag=True, help='Flag to train vision.')
-@click.option('--num-epochs', default=20, help='Number of epochs to train.')
+@click.option('--num-epochs', default=50, help='Number of epochs to train.')
 def run(use_box, train_mask, train_prompt, train_vision, num_epochs):
   print(f'Vision: {train_vision}, Mask: {train_mask}, Prompt: {train_prompt}, Use Box {use_box}, Num Epochs {num_epochs}')
-  
+
   for desired_class_id in range(1, len(voc_class_names)):
     class_name = voc_class_names[desired_class_id]
     model_name = setup_model_name(class_name, use_box, train_mask, train_prompt, train_vision )
@@ -213,6 +217,9 @@ def run(use_box, train_mask, train_prompt, train_vision, num_epochs):
             torch.save(model.state_dict(), model_name)
 
     torch.save(model.state_dict(), model_name)
+    model.to('cpu')
+    del model
+    torch.cuda.empty_cache()
 
 if __name__ == '__main__':
   run()
