@@ -15,6 +15,8 @@ import torch
 from torch.nn.functional import threshold, normalize
 import os 
 import click
+from labelgen.groundsam import GroundSam
+from groundingdino.util import box_ops
 
 
 voc_class_names = [
@@ -41,6 +43,7 @@ voc_class_names = [
     'tvmonitor',
 ] # 255 is ignore
 
+
 def get_bounding_box(ground_truth_map):
   # get bounding box from mask
   y_indices, x_indices = np.where(ground_truth_map > 0)
@@ -56,11 +59,18 @@ def get_bounding_box(ground_truth_map):
   return bbox
 
 class SAMDataset(Dataset):
-  def __init__(self, dataset, processor, desired_class_id, use_bounding_box = False):
+  def __init__(self, dataset, processor, desired_class_id, use_bounding_box = False, 
+               use_dino_box = False, class_name=False):
     self.dataset = dataset
     self.processor = processor
     self.desired_class_id = desired_class_id
     self.use_bounding_box = use_bounding_box
+    self.use_dino_box = use_dino_box
+    if self.use_dino_box:
+      self.groundsam = GroundSam('/home/models/sam_ckpt/sam_vit_h_4b8939.pth')
+      self.groundsam.move_to('cuda')
+      self.class_name = class_name
+      assert class_name is not None
 
   def __len__(self):
     return len(self.dataset)
@@ -80,6 +90,13 @@ class SAMDataset(Dataset):
     # get bounding box prompt
     if self.use_bounding_box:
       prompt = [[get_bounding_box(ground_truth_mask)]]
+    elif self.use_dino_box:
+      boxes, logits, phrases = self.groundsam.groundingdino_detect(image, self.class_name, box_threshold=0.5)
+      if boxes.shape[0] == 0:
+        return None
+      H, W, _ = np.array(image).shape
+      boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([W, H, W, H])
+      prompt = [boxes_xyxy.tolist()]
     else:
       prompt = None
     # prepare image and prompt for the model
@@ -95,9 +112,11 @@ class SAMDataset(Dataset):
     
     return inputs
 
-def setup_model_name(class_name, use_box, train_mask, train_prompt, train_vision):
+def setup_model_name(class_name, use_box, use_dino_box, train_mask, train_prompt, train_vision):
   if use_box:
     model_name = f'voc_trained/box/'
+  elif use_dino_box:
+     model_name = f'voc_trained/dino_box/'
   else:
     model_name = f'voc_trained/nobox/'
 
@@ -127,10 +146,11 @@ def get_dataset_of_class(desired_class_id, path_to_dataset='vocsegmentation', im
   ds = Subset(ds, inds)
   return ds
 
-def get_dataset(use_box, desired_class_id):
+def get_dataset(use_box, use_dino_box, desired_class_id, class_name):
   processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
   dataset = get_dataset_of_class(desired_class_id=desired_class_id, image_set='train')
-  train_dataset = SAMDataset(dataset=dataset, processor=processor, desired_class_id=desired_class_id, use_bounding_box=use_box)
+  train_dataset = SAMDataset(dataset=dataset, processor=processor, desired_class_id=desired_class_id, use_bounding_box=use_box, use_dino_box=use_dino_box,
+                             class_name=class_name)
   return train_dataset
 
 def get_model(train_mask, train_prompt, train_vision):
@@ -158,19 +178,21 @@ def get_model(train_mask, train_prompt, train_vision):
 
 
 @click.command()
-@click.option('--use-box', is_flag=True, help='Flag to use box.')
+@click.option('--use-gt-box', is_flag=True, help='Flag to use box.')
+@click.option('--use-dino-box', is_flag=True, help='Flag to use dino box.')
 @click.option('--train-mask', is_flag=True, help='Flag to train mask.')
 @click.option('--train-prompt', is_flag=True, help='Flag to train prompt.')
 @click.option('--train-vision', is_flag=True, help='Flag to train vision.')
 @click.option('--num-epochs', default=50, help='Number of epochs to train.')
-def run(use_box, train_mask, train_prompt, train_vision, num_epochs):
-  print(f'Vision: {train_vision}, Mask: {train_mask}, Prompt: {train_prompt}, Use Box {use_box}, Num Epochs {num_epochs}')
-
+def run(use_gt_box, use_dino_box, train_mask, train_prompt, train_vision, num_epochs):
+  print(f'Vision: {train_vision}, Mask: {train_mask}, Prompt: {train_prompt}, Use GT Box {use_gt_box}, Use DINO Box {use_dino_box}, Num Epochs {num_epochs}')
+  
+  assert not (use_gt_box and use_dino_box)
   for desired_class_id in range(1, len(voc_class_names)):
     class_name = voc_class_names[desired_class_id]
-    model_name = setup_model_name(class_name, use_box, train_mask, train_prompt, train_vision )
+    model_name = setup_model_name(class_name, use_gt_box, use_dino_box, train_mask, train_prompt, train_vision )
 
-    train_dataset = get_dataset(use_box, desired_class_id)
+    train_dataset = get_dataset(use_gt_box, use_dino_box, desired_class_id, class_name)
     print(class_name, len(train_dataset))
     train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, pin_memory=True, num_workers=8)
 
@@ -188,7 +210,7 @@ def run(use_box, train_mask, train_prompt, train_vision, num_epochs):
     for epoch in range(num_epochs):
         epoch_losses = []
         for batch in tqdm(train_dataloader):
-            if use_box:
+            if use_dino_box or use_gt_box:
                 input_boxes = batch["input_boxes"].to(device)
             else:
                 input_boxes = None
